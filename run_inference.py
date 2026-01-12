@@ -44,7 +44,7 @@ def run_inference(args: argparse.Namespace):
         frame_writer = FrameDiskCache(args.frame_cache_dir)
 
     model = StreamVGGT(total_budget=1200000)
-    ckpt = torch.load(args.checkpoint_path, map_location="cpu")
+    ckpt = torch.load(args.checkpoint_path, map_location="cpu", weights_only=False)
 
     model.load_state_dict(ckpt, strict=True)
     model = model.to(device)
@@ -94,6 +94,123 @@ def run_inference(args: argparse.Namespace):
     print("="*50 + "\n")
     
     if (not cache_results) or output.ress is None or len(output.ress) == 0:
+        # 如果使用了 frame_cache_dir，尝试从 .pt 文件中聚合数据
+        if args.frame_cache_dir and os.path.exists(args.frame_cache_dir):
+            print(f"\n从 {args.frame_cache_dir} 读取并聚合数据...")
+            try:
+                from pathlib import Path
+                pt_dir = Path(args.frame_cache_dir)
+                pt_files = sorted(pt_dir.glob("*.pt"))
+                
+                if pt_files:
+                    print(f"找到 {len(pt_files)} 个 .pt 文件")
+                    
+                    all_depths = []
+                    all_depth_confs = []
+                    all_pts3d = []
+                    all_confs = []
+                    all_camera_poses = []
+                    all_extrinsics = []
+                    all_intrinsics = []
+                    
+                    for pt_file in pt_files:
+                        data = torch.load(pt_file, map_location='cpu', weights_only=False)
+                        pred = data.get("pred", {})
+                        
+                        if "depth" in pred:
+                            depth = pred["depth"]
+                            if depth.dim() == 3 and depth.shape[0] == 1:
+                                depth = depth.squeeze(0)
+                            all_depths.append(depth)
+                        
+                        if "depth_conf" in pred:
+                            depth_conf = pred["depth_conf"]
+                            if depth_conf.dim() == 3 and depth_conf.shape[0] == 1:
+                                depth_conf = depth_conf.squeeze(0)
+                            all_depth_confs.append(depth_conf)
+                        
+                        if "pts3d_in_other_view" in pred:
+                            pts3d = pred["pts3d_in_other_view"]
+                            if pts3d.dim() == 4 and pts3d.shape[0] == 1:
+                                pts3d = pts3d.squeeze(0)
+                            elif pts3d.dim() == 3 and pts3d.shape[0] == 1:
+                                pts3d = pts3d.squeeze(0)
+                            all_pts3d.append(pts3d)
+                        
+                        if "conf" in pred:
+                            conf = pred["conf"]
+                            if conf.dim() == 3 and conf.shape[0] == 1:
+                                conf = conf.squeeze(0)
+                            elif conf.dim() == 2 and conf.shape[0] == 1:
+                                conf = conf.squeeze(0)
+                            all_confs.append(conf)
+                        
+                        if "camera_pose" in pred:
+                            camera_pose = pred["camera_pose"]
+                            if camera_pose.dim() == 3 and camera_pose.shape[0] == 1:
+                                camera_pose = camera_pose.squeeze(0)
+                            all_camera_poses.append(camera_pose)
+                        
+                        if "extrinsic_world_to_cam" in pred:
+                            extrinsic = pred["extrinsic_world_to_cam"]
+                            if extrinsic.dim() == 3 and extrinsic.shape[0] == 1:
+                                extrinsic = extrinsic.squeeze(0)
+                            all_extrinsics.append(extrinsic)
+                        
+                        if "intrinsic" in pred:
+                            intrinsic = pred["intrinsic"]
+                            if intrinsic.dim() == 3 and intrinsic.shape[0] == 1:
+                                intrinsic = intrinsic.squeeze(0)
+                            all_intrinsics.append(intrinsic)
+                    
+                    # 聚合数据
+                    predictions = {}
+                    
+                    if all_depths:
+                        predictions["depth"] = torch.stack(all_depths, dim=0)
+                    if all_depth_confs:
+                        predictions["depth_conf"] = torch.stack(all_depth_confs, dim=0)
+                    if all_pts3d:
+                        try:
+                            predictions["world_points"] = torch.stack(all_pts3d, dim=0)
+                        except RuntimeError:
+                            predictions["world_points"] = all_pts3d  # 保存为列表
+                    if all_confs:
+                        try:
+                            predictions["world_points_conf"] = torch.stack(all_confs, dim=0)
+                        except RuntimeError:
+                            predictions["world_points_conf"] = all_confs
+                    if all_camera_poses:
+                        predictions["pose_enc"] = torch.stack(all_camera_poses, dim=0)
+                    if all_extrinsics:
+                        predictions["extrinsic"] = torch.stack(all_extrinsics, dim=0)
+                    if all_intrinsics:
+                        predictions["intrinsic"] = torch.stack(all_intrinsics, dim=0)
+                    
+                    # 添加图像数据（从原始输入）
+                    predictions["images"] = images.detach().cpu()
+                    
+                    # 如果还没有 extrinsic 和 intrinsic，尝试从 pose_enc 转换
+                    if "pose_enc" in predictions and "extrinsic" not in predictions:
+                        extrinsic, intrinsic = pose_encoding_to_extri_intri(
+                            predictions["pose_enc"].unsqueeze(0),
+                            images.shape[-2:]
+                        )
+                        if extrinsic is not None:
+                            predictions["extrinsic"] = extrinsic.squeeze(0)
+                        if intrinsic is not None:
+                            predictions["intrinsic"] = intrinsic.squeeze(0)
+                    
+                    print(f"成功聚合 {len(pt_files)} 帧的数据")
+                    torch.cuda.empty_cache()
+                    return predictions
+                else:
+                    print(f"警告: 在 {args.frame_cache_dir} 中未找到 .pt 文件")
+            except Exception as e:
+                print(f"警告: 从 .pt 文件聚合数据时出错: {e}")
+                import traceback
+                traceback.print_exc()
+        
         summary = {"per_frame_only": True}
         if args.frame_cache_dir:
             summary["frame_cache_dir"] = args.frame_cache_dir
@@ -178,8 +295,12 @@ if __name__ == "__main__":
         cache_dir = result.get("frame_cache_dir", args.frame_cache_dir)
         if cache_dir:
             print(f"Inference finished. Per-frame outputs saved under {cache_dir}.")
+            print(f"提示: 可以使用 extract_from_pt_files.py 从这些文件中提取聚合数据，")
+            print(f"      或者重新运行时不使用 --no_cache_results 来直接保存聚合结果。")
         else:
             print("Inference finished. Per-frame outputs were written via custom frame_writer.")
     else:
+        # 保存聚合的结果
         torch.save(result, args.output_path)
         print(f"Inference finished. Results saved to {args.output_path}")
+        print(f"保存的数据包括: {list(result.keys())}")
