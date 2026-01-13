@@ -57,6 +57,7 @@ data/
 neural_rgbd_data/
 output/
 datasets/
+vis/
 
 # Temporary files
 *.tmp

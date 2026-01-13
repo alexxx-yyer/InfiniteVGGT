@@ -15,8 +15,15 @@ Example:
 import os
 import sys
 import argparse
+import time
 import numpy as np
 from scipy.spatial.transform import Rotation as R
+from multiprocessing import Pool, cpu_count
+from functools import partial
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = lambda x, **kwargs: x
 
 # Try to import ROS modules
 try:
@@ -435,81 +442,41 @@ def matrix_to_axis_marker(c2w_matrix, frame_id="map", timestamp=None, scale=0.1,
     return marker
 
 
-def load_data_from_output_dir(output_dir, downsample=100):
+def _load_single_frame(args):
     """
-    Load point cloud data from output directory created by demo.py.
+    加载单帧数据（用于多进程）
     
     Args:
-        output_dir: Directory containing depth/, color/, conf/, camera/ subdirectories
-        downsample: Downsampling factor - keep 1 point every N points (default: 100)
+        args: tuple (i, depth_file, color_file, conf_file, camera_file, downsample, has_confidence)
     
     Returns:
-        tuple: (points_list, colors_list, confidence_list, poses_list)
+        tuple: (points_world, colors, confidence_flat, c2w, i) 或 (None, None, None, None, i) 如果出错
     """
-    depth_dir = os.path.join(output_dir, "depth")
-    color_dir = os.path.join(output_dir, "color")
-    conf_dir = os.path.join(output_dir, "conf")
-    camera_dir = os.path.join(output_dir, "camera")
-    
-    if not os.path.exists(depth_dir) or not os.path.exists(color_dir) or not os.path.exists(camera_dir):
-        raise ValueError(f"Output directory {output_dir} does not contain required subdirectories")
-    
-    # Check if confidence directory exists
-    has_confidence = os.path.exists(conf_dir)
-    if not has_confidence:
-        print(f"Warning: No confidence directory found in {output_dir}")
-    
-    # Get all frame files
-    depth_files = sorted([f for f in os.listdir(depth_dir) if f.endswith('.npy')])
-    color_files = sorted([f for f in os.listdir(color_dir) if f.endswith('.png')])
-    camera_files = sorted([f for f in os.listdir(camera_dir) if f.endswith('.npz')])
-    
-    if has_confidence:
-        conf_files = sorted([f for f in os.listdir(conf_dir) if f.endswith('.npy')])
-        if len(depth_files) != len(conf_files):
-            print(f"Warning: Mismatch in number of confidence files. Depth: {len(depth_files)}, Conf: {len(conf_files)}")
-    
-    if len(depth_files) != len(color_files) or len(depth_files) != len(camera_files):
-        print(f"Warning: Mismatch in number of files. Depth: {len(depth_files)}, Color: {len(color_files)}, Camera: {len(camera_files)}")
-    
-    num_frames = min(len(depth_files), len(color_files), len(camera_files))
-    
-    points_list = []
-    colors_list = []
-    confidence_list = []
-    poses_list = []
-    
-    print(f"Loading {num_frames} frames from {output_dir}...")
-    
-    for i in range(num_frames):
+    i, depth_file, color_file, conf_file, camera_file, downsample, has_confidence = args
+    try:
+        import cv2
+        
         # Load depth
-        depth_path = os.path.join(depth_dir, depth_files[i])
-        depth = np.load(depth_path)
+        depth = np.load(depth_file)
         
         # Load color
-        import cv2
-        color_path = os.path.join(color_dir, color_files[i])
-        color_bgr = cv2.imread(color_path)
+        color_bgr = cv2.imread(color_file)
+        if color_bgr is None:
+            raise ValueError(f"Failed to load color image: {color_file}")
         color_rgb = cv2.cvtColor(color_bgr, cv2.COLOR_BGR2RGB) / 255.0
         
         # Load confidence if available
-        if has_confidence and i < len(conf_files):
-            conf_path = os.path.join(conf_dir, conf_files[i])
-            confidence = np.load(conf_path)
+        if has_confidence and conf_file is not None and os.path.exists(conf_file):
+            confidence = np.load(conf_file)
         else:
             confidence = None
         
         # Load camera pose
-        camera_path = os.path.join(camera_dir, camera_files[i])
-        camera_data = np.load(camera_path)
+        camera_data = np.load(camera_file)
         c2w = camera_data['pose']  # 4x4 matrix
         
-        # Use the points directly from the saved data if available
-        # Otherwise, reconstruct from depth
-        # For now, we'll use the depth to reconstruct points
-        # Handle different depth array shapes (2D, 3D with channel dimension, etc.)
+        # Handle different depth array shapes
         if depth.ndim > 2:
-            # If depth has more than 2 dimensions, squeeze out singleton dimensions
             depth = np.squeeze(depth)
         if depth.ndim != 2:
             raise ValueError(f"Expected depth to be 2D after squeezing, but got shape {depth.shape}")
@@ -517,16 +484,14 @@ def load_data_from_output_dir(output_dir, downsample=100):
         
         # Handle confidence array shape to match depth
         if confidence is not None:
-            # Handle different confidence array shapes
             if confidence.ndim > 2:
                 confidence = np.squeeze(confidence)
-            # Ensure confidence matches depth dimensions
             if confidence.ndim == 2 and confidence.shape != (H, W):
-                # If shapes don't match after squeezing, try to reshape
                 if confidence.size == H * W:
                     confidence = confidence.reshape(H, W)
                 else:
-                    print(f"Warning: Confidence shape {confidence.shape} doesn't match depth shape ({H}, {W})")
+                    confidence = None  # Skip confidence if shapes don't match
+        
         intrinsics = camera_data['intrinsics']
         fx, fy = intrinsics[0, 0], intrinsics[1, 1]
         cx, cy = intrinsics[0, 2], intrinsics[1, 2]
@@ -570,19 +535,119 @@ def load_data_from_output_dir(output_dir, downsample=100):
             if confidence_flat is not None:
                 confidence_flat = confidence_flat[indices]
         
-        points_list.append(points_world)
-        colors_list.append(colors)
-        confidence_list.append(confidence_flat)
-        poses_list.append(c2w)
-        
-        if (i + 1) % 10 == 0:
-            print(f"  Loaded {i + 1}/{num_frames} frames...")
+        return (points_world, colors, confidence_flat, c2w, i)
+    except Exception as e:
+        print(f"警告: 加载第 {i} 帧时出错: {e}")
+        return (None, None, None, None, i)
+
+
+def load_data_from_output_dir(output_dir, downsample=100, num_workers=None):
+    """
+    Load point cloud data from output directory created by demo.py.
     
-    print(f"Successfully loaded {num_frames} frames")
+    Args:
+        output_dir: Directory containing depth/, color/, conf/, camera/ subdirectories
+        downsample: Downsampling factor - keep 1 point every N points (default: 100)
+        num_workers: Number of parallel workers, default uses half of CPU cores
+    
+    Returns:
+        tuple: (points_list, colors_list, confidence_list, poses_list)
+    """
+    depth_dir = os.path.join(output_dir, "depth")
+    color_dir = os.path.join(output_dir, "color")
+    conf_dir = os.path.join(output_dir, "conf")
+    camera_dir = os.path.join(output_dir, "camera")
+    
+    if not os.path.exists(depth_dir) or not os.path.exists(color_dir) or not os.path.exists(camera_dir):
+        raise ValueError(f"Output directory {output_dir} does not contain required subdirectories")
+    
+    # Check if confidence directory exists
+    has_confidence = os.path.exists(conf_dir)
+    if not has_confidence:
+        print(f"Warning: No confidence directory found in {output_dir}")
+    
+    # Get all frame files
+    depth_files = sorted([f for f in os.listdir(depth_dir) if f.endswith('.npy')])
+    color_files = sorted([f for f in os.listdir(color_dir) if f.endswith('.png')])
+    camera_files = sorted([f for f in os.listdir(camera_dir) if f.endswith('.npz')])
+    
+    if has_confidence:
+        conf_files = sorted([f for f in os.listdir(conf_dir) if f.endswith('.npy')])
+        if len(depth_files) != len(conf_files):
+            print(f"Warning: Mismatch in number of confidence files. Depth: {len(depth_files)}, Conf: {len(conf_files)}")
+    else:
+        conf_files = []
+    
+    if len(depth_files) != len(color_files) or len(depth_files) != len(camera_files):
+        print(f"Warning: Mismatch in number of files. Depth: {len(depth_files)}, Color: {len(color_files)}, Camera: {len(camera_files)}")
+    
+    num_frames = min(len(depth_files), len(color_files), len(camera_files))
+    
+    print(f"Loading {num_frames} frames from {output_dir}...")
+    
+    # 确定工作进程数
+    if num_workers is None:
+        num_workers = max(1, cpu_count() - 1)  # 使用 CPU核心数 - 1，保留一个核心给系统
+    num_workers = min(num_workers, num_frames)  # 不超过帧数
+    
+    # 准备任务参数
+    tasks = []
+    for i in range(num_frames):
+        depth_path = os.path.join(depth_dir, depth_files[i])
+        color_path = os.path.join(color_dir, color_files[i])
+        camera_path = os.path.join(camera_dir, camera_files[i])
+        conf_path = os.path.join(conf_dir, conf_files[i]) if has_confidence and i < len(conf_files) else None
+        tasks.append((i, depth_path, color_path, conf_path, camera_path, downsample, has_confidence))
+    
+    # 并行加载数据
+    points_list = [None] * num_frames
+    colors_list = [None] * num_frames
+    confidence_list = [None] * num_frames
+    poses_list = [None] * num_frames
+    
+    start_time = time.time()
+    if num_frames > 1 and num_workers > 1:
+        print(f"使用 {num_workers} 个进程并行加载数据...")
+        with Pool(processes=num_workers) as pool:
+            results = list(tqdm(
+                pool.imap(_load_single_frame, tasks),
+                total=num_frames,
+                desc="加载数据",
+                unit="帧"
+            ))
+    else:
+        # 单进程加载
+        results = list(tqdm(
+            map(_load_single_frame, tasks),
+            total=num_frames,
+            desc="加载数据",
+            unit="帧"
+        ))
+    load_time = time.time() - start_time
+    print(f"加载数据耗时: {load_time:.2f} 秒")
+    
+    # 整理结果
+    for points_world, colors, confidence_flat, c2w, i in results:
+        if points_world is not None:
+            points_list[i] = points_world
+            colors_list[i] = colors
+            confidence_list[i] = confidence_flat
+            poses_list[i] = c2w
+    
+    # 过滤掉 None 值（如果有失败的帧）
+    valid_indices = [i for i in range(num_frames) if points_list[i] is not None]
+    if len(valid_indices) < num_frames:
+        print(f"警告: 成功加载 {len(valid_indices)}/{num_frames} 帧")
+        points_list = [points_list[i] for i in valid_indices]
+        colors_list = [colors_list[i] for i in valid_indices]
+        confidence_list = [confidence_list[i] for i in valid_indices]
+        poses_list = [poses_list[i] for i in valid_indices]
+    
+    print(f"Successfully loaded {len(points_list)} frames")
     return points_list, colors_list, confidence_list, poses_list
 
 
-def export_to_rosbag(output_dir, bag_file, frame_rate=30.0, downsample=100):
+def export_to_rosbag(output_dir, bag_file, frame_rate=30.0, downsample=100, num_workers=None):
     """
     Export point cloud data to ROS bag file.
     
@@ -591,9 +656,13 @@ def export_to_rosbag(output_dir, bag_file, frame_rate=30.0, downsample=100):
         bag_file: Output ROS bag file path
         frame_rate: Frame rate for the bag file (Hz)
         downsample: Downsampling factor - keep 1 point every N points (default: 100)
+        num_workers: Number of parallel workers for loading data, default uses half of CPU cores
     """
+    total_start_time = time.time()
     # Load data
-    points_list, colors_list, confidence_list, poses_list = load_data_from_output_dir(output_dir, downsample=downsample)
+    points_list, colors_list, confidence_list, poses_list = load_data_from_output_dir(
+        output_dir, downsample=downsample, num_workers=num_workers
+    )
     
     num_frames = len(points_list)
     frame_duration = rospy.Duration(1.0 / frame_rate)
@@ -620,13 +689,14 @@ def export_to_rosbag(output_dir, bag_file, frame_rate=30.0, downsample=100):
     bag = rosbag.Bag(bag_file, 'w')
     
     try:
-        start_time = rospy.Time.now()
+        start_time_ros = rospy.Time.now()
         prev_pose = None
         prev_timestamp = None
         path_poses = []  # Accumulate poses for Path message
         
+        write_start_time = time.time()
         for i in range(num_frames):
-            timestamp = start_time + frame_duration * i
+            timestamp = start_time_ros + frame_duration * i
             
             # Write point cloud with confidence if available
             pc_msg = numpy_to_pointcloud2(
@@ -687,8 +757,12 @@ def export_to_rosbag(output_dir, bag_file, frame_rate=30.0, downsample=100):
             if (i + 1) % 10 == 0:
                 print(f"  Written {i + 1}/{num_frames} frames...")
         
+        write_time = time.time() - write_start_time
         print(f"\nSuccessfully wrote {num_frames} frames to {bag_file}")
         print(f"Bag file size: {os.path.getsize(bag_file) / (1024*1024):.2f} MB")
+        print(f"写入bag文件耗时: {write_time:.2f} 秒")
+        total_time = time.time() - total_start_time
+        print(f"\n导出ROS bag总耗时: {total_time:.2f} 秒")
         
     finally:
         bag.close()
@@ -724,6 +798,12 @@ def parse_args():
         default=100,
         help="Downsampling factor - keep 1 point every N points (default: 100)",
     )
+    parser.add_argument(
+        "--num_workers",
+        type=int,
+        default=None,
+        help="Number of parallel workers for loading data (default: half of CPU cores)",
+    )
     return parser.parse_args()
 
 
@@ -744,7 +824,8 @@ def main():
             args.output_dir,
             args.bag_file,
             args.frame_rate,
-            args.downsample
+            args.downsample,
+            args.num_workers
         )
         print("\nExport completed successfully!")
         print(f"\nTo play the bag file in RViz:")

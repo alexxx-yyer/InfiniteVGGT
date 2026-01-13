@@ -5,6 +5,7 @@ import sys
 import glob
 import time
 import argparse
+import re
 from typing import List, Dict, Optional
 
 # Add project source to the Python path
@@ -20,6 +21,34 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 SRC_ROOT = os.path.join(PROJECT_ROOT, "src")
 if SRC_ROOT not in sys.path:
     sys.path.append(SRC_ROOT)
+
+def natural_sort_key(filename: str) -> tuple:
+    """
+    自然排序键函数，能够正确处理文件名中的数字。
+    
+    例如：
+    - img0.png -> (0,)
+    - img10.png -> (10,)
+    - img100.png -> (100,)
+    
+    这样排序后：img0.png < img10.png < img100.png < img1000.png
+    """
+    # 提取文件名（不含路径和扩展名）
+    basename = os.path.basename(filename)
+    name_without_ext = os.path.splitext(basename)[0]
+    
+    # 使用正则表达式分割字符串和数字
+    parts = re.split(r'(\d+)', name_without_ext)
+    
+    # 将数字部分转换为整数，非数字部分保持字符串
+    key_parts = []
+    for part in parts:
+        if part.isdigit():
+            key_parts.append(int(part))
+        else:
+            key_parts.append(part.lower())  # 转换为小写以便不区分大小写排序
+    
+    return tuple(key_parts)
 
 def run_inference(args: argparse.Namespace):
     """
@@ -53,13 +82,22 @@ def run_inference(args: argparse.Namespace):
     print("Model loaded successfully onto the GPU.")
 
     print(f"Loading images from input directory: {args.input_dir}")
-    image_names = sorted(glob.glob(os.path.join(args.input_dir, "*")))
+    # 获取所有文件，支持常见图片格式
+    image_extensions = ['*.png', '*.jpg', '*.jpeg', '*.PNG', '*.JPG', '*.JPEG']
+    image_names = []
+    for ext in image_extensions:
+        image_names.extend(glob.glob(os.path.join(args.input_dir, ext)))
+    
+    # 使用自然排序确保数字顺序正确（例如：img0.png, img10.png, img100.png）
+    image_names = sorted(image_names, key=natural_sort_key)
     
     if not image_names:
         print(f"Error: No images found in {args.input_dir}. Please check the path and file extensions.")
         return
         
     print(f"Found {len(image_names)} images to process.")
+    print(f"前5个文件: {[os.path.basename(f) for f in image_names[:5]]}")
+    print(f"后5个文件: {[os.path.basename(f) for f in image_names[-5:]]}")
     images = load_and_preprocess_images(image_names).to(device)
     print(f"Preprocessed images tensor shape: {images.shape}")
 

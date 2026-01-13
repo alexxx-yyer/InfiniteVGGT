@@ -10,8 +10,16 @@ import numpy as np
 from pathlib import Path
 import argparse
 import sys
+import time
+import multiprocessing
 from multiprocessing import Pool, cpu_count
 from functools import partial
+
+# 设置多进程启动方法为 spawn，避免与 PyTorch 的兼容性问题
+try:
+    multiprocessing.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass  # 已经设置过了
 try:
     from tqdm import tqdm
 except ImportError:
@@ -49,13 +57,125 @@ except ImportError:
     sys.exit(1)
 
 
-def extract_data_from_pt_files(pt_path: str, output_path: str = None):
+def _process_single_pt_file(pt_file):
+    """
+    处理单个 .pt 文件（用于多进程）
+    
+    Args:
+        pt_file: .pt 文件路径
+    
+    Returns:
+        tuple: (frame_data_dict, frame_idx, is_aggregated)
+        如果出错返回 (None, None, False)
+    """
+    try:
+        data = torch.load(pt_file, map_location='cpu', weights_only=False)
+        
+        # 检测文件格式：聚合文件还是单帧文件
+        is_aggregated = "pred" not in data and ("depth" in data or "world_points" in data)
+        
+        if is_aggregated:
+            # 聚合文件，返回整个数据字典
+            return (data, None, True)
+        else:
+            # 单帧文件，提取数据
+            frame_data = {}
+            
+            # 提取帧索引
+            frame_idx = data.get("meta", {}).get("frame_idx", None)
+            if frame_idx is None:
+                try:
+                    frame_idx = int(Path(pt_file).stem)
+                except ValueError:
+                    frame_idx = None
+            
+            # 提取 pred 部分的数据
+            pred = data.get("pred", {})
+            
+            # 提取深度图
+            if "depth" in pred:
+                depth = pred["depth"]
+                if depth.dim() == 3 and depth.shape[0] == 1:
+                    depth = depth.squeeze(0)
+                frame_data["depth"] = depth
+            
+            # 提取深度置信度
+            if "depth_conf" in pred:
+                depth_conf = pred["depth_conf"]
+                if depth_conf.dim() == 3 and depth_conf.shape[0] == 1:
+                    depth_conf = depth_conf.squeeze(0)
+                frame_data["depth_conf"] = depth_conf
+            
+            # 提取 3D 点
+            if "pts3d_in_other_view" in pred:
+                pts3d = pred["pts3d_in_other_view"]
+                if pts3d.dim() == 4 and pts3d.shape[0] == 1:
+                    pts3d = pts3d.squeeze(0)
+                elif pts3d.dim() == 3 and pts3d.shape[0] == 1:
+                    pts3d = pts3d.squeeze(0)
+                frame_data["pts3d"] = pts3d
+            
+            # 提取置信度
+            if "conf" in pred:
+                conf = pred["conf"]
+                if conf.dim() == 3 and conf.shape[0] == 1:
+                    conf = conf.squeeze(0)
+                elif conf.dim() == 2 and conf.shape[0] == 1:
+                    conf = conf.squeeze(0)
+                frame_data["conf"] = conf
+            
+            # 提取相机位姿编码
+            if "camera_pose" in pred:
+                camera_pose = pred["camera_pose"]
+                if camera_pose.dim() == 3 and camera_pose.shape[0] == 1:
+                    camera_pose = camera_pose.squeeze(0)
+                frame_data["camera_pose"] = camera_pose
+            
+            # 提取外参矩阵
+            if "extrinsic_world_to_cam" in pred:
+                extrinsic = pred["extrinsic_world_to_cam"]
+                if extrinsic.dim() == 3 and extrinsic.shape[0] == 1:
+                    extrinsic = extrinsic.squeeze(0)
+                frame_data["extrinsic"] = extrinsic
+            
+            # 提取内参矩阵
+            if "intrinsic" in pred:
+                intrinsic = pred["intrinsic"]
+                if intrinsic.dim() == 3 and intrinsic.shape[0] == 1:
+                    intrinsic = intrinsic.squeeze(0)
+                frame_data["intrinsic"] = intrinsic
+            
+            # 提取 view 部分的数据
+            view = data.get("view", {})
+            
+            # 提取图像
+            if "img" in view:
+                img = view["img"]
+                if img.dim() == 4 and img.shape[0] == 1:
+                    img = img.squeeze(0)
+                frame_data["img"] = img
+            
+            # 提取世界坐标系下的相机位姿
+            if "camera_pose" in view:
+                cam_pose_world = view["camera_pose"]
+                if cam_pose_world.dim() == 3 and cam_pose_world.shape[0] == 1:
+                    cam_pose_world = cam_pose_world.squeeze(0)
+                frame_data["camera_pose_world"] = cam_pose_world
+            
+            return (frame_data, frame_idx, False)
+    except Exception as e:
+        print(f"警告: 读取 {pt_file} 时出错: {e}")
+        return (None, None, False)
+
+
+def extract_data_from_pt_files(pt_path: str, output_path: str = None, num_workers: int = None):
     """
     从 .pt 文件中提取并聚合所有数据
     
     Args:
         pt_path: .pt 文件路径或包含 .pt 文件的目录路径
         output_path: 输出文件路径（可选）
+        num_workers: 并行处理的进程数，默认使用一半CPU核心
     
     Returns:
         包含所有聚合数据的字典
@@ -93,229 +213,176 @@ def extract_data_from_pt_files(pt_path: str, output_path: str = None):
     
     frame_indices = []
     
-    # 使用 tqdm 显示读取进度
-    for pt_file in tqdm(pt_files, desc="读取 .pt 文件", unit="文件"):
-        try:
-            data = torch.load(pt_file, map_location='cpu', weights_only=False)
-            
-            # 检测文件格式：聚合文件还是单帧文件
-            # 聚合文件直接包含 depth, world_points 等键，且第一个维度是批次维度
-            # 单帧文件包含 pred/view/meta 结构
-            is_aggregated = "pred" not in data and ("depth" in data or "world_points" in data)
-            
-            if is_aggregated:
-                # 这是聚合文件，直接提取数据
-                print(f"检测到聚合文件格式，包含多帧数据")
-                
-                # 首先确定帧数（从任何可用的数据中）
-                num_frames = 0
-                if "depth" in data and data["depth"].dim() >= 2:
-                    num_frames = data["depth"].shape[0]
-                elif "images" in data and data["images"].dim() >= 3:
-                    num_frames = data["images"].shape[0]
-                elif "world_points" in data and data["world_points"].dim() >= 2:
-                    num_frames = data["world_points"].shape[0]
-                elif "pose_enc" in data and data["pose_enc"].dim() >= 2:
-                    num_frames = data["pose_enc"].shape[0]
-                elif "extrinsic" in data and data["extrinsic"].dim() >= 2:
-                    num_frames = data["extrinsic"].shape[0]
-                
-                if num_frames == 0:
-                    print("警告: 无法确定帧数，假设为单帧")
-                    num_frames = 1
-                
-                print(f"检测到 {num_frames} 帧数据")
-                
-                # 初始化 frame_indices
-                frame_indices = list(range(num_frames))
-                
-                # 从聚合文件中提取数据
-                if "depth" in data:
-                    depth = data["depth"]
-                    # 处理各种可能的深度图形状
-                    if depth.dim() == 5:  # (1, N, H, W, 1) 或类似
-                        depth = depth.squeeze(0).squeeze(-1)  # 去掉第一个和最后一个维度
-                    elif depth.dim() == 4:  # (N, H, W, 1) 或 (1, N, H, W)
-                        if depth.shape[0] == 1:
-                            depth = depth.squeeze(0)
-                        if depth.dim() == 4 and depth.shape[-1] == 1:
-                            depth = depth.squeeze(-1)
-                    # 如果是 (N, H, W)，按帧拆分
-                    if depth.dim() == 3:
-                        for i in range(depth.shape[0]):
-                            all_depths.append(depth[i])
-                    else:
-                        all_depths.append(depth)
-                
-                if "depth_conf" in data:
-                    depth_conf = data["depth_conf"]
-                    if depth_conf.dim() == 3:
-                        for i in range(depth_conf.shape[0]):
-                            all_depth_confs.append(depth_conf[i])
-                    else:
-                        all_depth_confs.append(depth_conf)
-                
-                if "world_points" in data:
-                    pts3d = data["world_points"]
-                    if pts3d.dim() == 4:  # (N, H, W, 3)
-                        for i in range(pts3d.shape[0]):
-                            all_pts3d.append(pts3d[i])
-                    elif pts3d.dim() == 3:  # (N, M, 3)
-                        for i in range(pts3d.shape[0]):
-                            all_pts3d.append(pts3d[i])
-                    else:
-                        all_pts3d.append(pts3d)
-                
-                if "world_points_conf" in data:
-                    conf = data["world_points_conf"]
-                    if conf.dim() == 3:
-                        for i in range(conf.shape[0]):
-                            all_confs.append(conf[i])
-                    elif conf.dim() == 2:
-                        for i in range(conf.shape[0]):
-                            all_confs.append(conf[i])
-                    else:
-                        all_confs.append(conf)
-                
-                if "pose_enc" in data:
-                    camera_pose = data["pose_enc"]
-                    if camera_pose.dim() == 3:
-                        for i in range(camera_pose.shape[0]):
-                            all_camera_poses.append(camera_pose[i])
-                    else:
-                        all_camera_poses.append(camera_pose)
-                
-                if "extrinsic" in data:
-                    extrinsic = data["extrinsic"]
-                    if extrinsic.dim() == 3:
-                        for i in range(extrinsic.shape[0]):
-                            all_extrinsics.append(extrinsic[i])
-                    else:
-                        all_extrinsics.append(extrinsic)
-                
-                if "intrinsic" in data:
-                    intrinsic = data["intrinsic"]
-                    if intrinsic is not None:
-                        if intrinsic.dim() == 3:
-                            for i in range(intrinsic.shape[0]):
-                                all_intrinsics.append(intrinsic[i])
-                        elif intrinsic.dim() == 2:
-                            # 单帧的内参，复制给所有帧
-                            for i in range(num_frames):
-                                all_intrinsics.append(intrinsic)
-                        else:
-                            all_intrinsics.append(intrinsic)
-                
-                if "images" in data:
-                    images = data["images"]
-                    if images.dim() == 4:  # (N, C, H, W) or (N, H, W, C)
-                        for i in range(images.shape[0]):
-                            all_images.append(images[i])
-                    else:
-                        all_images.append(images)
-                
-                # 验证数据一致性
-                if all_depths and len(all_depths) != num_frames:
-                    print(f"警告: 深度图数量 ({len(all_depths)}) 与帧数 ({num_frames}) 不匹配")
-                if all_images and len(all_images) != num_frames:
-                    print(f"警告: 图像数量 ({len(all_images)}) 与帧数 ({num_frames}) 不匹配")
-                
-                # 聚合文件处理完成，跳出循环（只处理第一个文件）
-                break
-            else:
-                # 这是单帧文件，按原来的方式处理
-                # 提取帧索引
-                frame_idx = data.get("meta", {}).get("frame_idx", None)
-                if frame_idx is None:
-                    # 尝试从文件名提取
-                    try:
-                        frame_idx = int(pt_file.stem)
-                    except ValueError:
-                        # 如果文件名不是数字，使用索引
-                        frame_idx = len(frame_indices)
-                frame_indices.append(frame_idx)
-                
-                # 提取 pred 部分的数据
-                pred = data.get("pred", {})
-                
-                # 提取深度图
-                if "depth" in pred:
-                    depth = pred["depth"]
-                    # 如果是 (1, H, W) 或 (B, H, W)，去掉 batch 维度
-                    if depth.dim() == 3 and depth.shape[0] == 1:
-                        depth = depth.squeeze(0)
-                    all_depths.append(depth)
-                
-                # 提取深度置信度
-                if "depth_conf" in pred:
-                    depth_conf = pred["depth_conf"]
-                    if depth_conf.dim() == 3 and depth_conf.shape[0] == 1:
-                        depth_conf = depth_conf.squeeze(0)
-                    all_depth_confs.append(depth_conf)
-                
-                # 提取 3D 点
-                if "pts3d_in_other_view" in pred:
-                    pts3d = pred["pts3d_in_other_view"]
-                    if pts3d.dim() == 4 and pts3d.shape[0] == 1:  # (1, H, W, 3)
-                        pts3d = pts3d.squeeze(0)
-                    elif pts3d.dim() == 3 and pts3d.shape[0] == 1:  # (1, N, 3)
-                        pts3d = pts3d.squeeze(0)
-                    all_pts3d.append(pts3d)
-                
-                # 提取置信度
-                if "conf" in pred:
-                    conf = pred["conf"]
-                    if conf.dim() == 3 and conf.shape[0] == 1:
-                        conf = conf.squeeze(0)
-                    elif conf.dim() == 2 and conf.shape[0] == 1:
-                        conf = conf.squeeze(0)
-                    all_confs.append(conf)
-                
-                # 提取相机位姿编码
-                if "camera_pose" in pred:
-                    camera_pose = pred["camera_pose"]
-                    if camera_pose.dim() == 3 and camera_pose.shape[0] == 1:
-                        camera_pose = camera_pose.squeeze(0)
-                    all_camera_poses.append(camera_pose)
-                
-                # 提取外参矩阵
-                if "extrinsic_world_to_cam" in pred:
-                    extrinsic = pred["extrinsic_world_to_cam"]
-                    if extrinsic.dim() == 3 and extrinsic.shape[0] == 1:
-                        extrinsic = extrinsic.squeeze(0)
-                    all_extrinsics.append(extrinsic)
-                
-                # 提取内参矩阵
-                if "intrinsic" in pred:
-                    intrinsic = pred["intrinsic"]
-                    if intrinsic.dim() == 3 and intrinsic.shape[0] == 1:
-                        intrinsic = intrinsic.squeeze(0)
-                    all_intrinsics.append(intrinsic)
-                
-                # 提取 view 部分的数据
-                view = data.get("view", {})
-                
-                # 提取图像
-                if "img" in view:
-                    img = view["img"]
-                    if img.dim() == 4 and img.shape[0] == 1:  # (1, C, H, W)
-                        img = img.squeeze(0)
-                    all_images.append(img)
-                
-                # 提取世界坐标系下的相机位姿
-                if "camera_pose" in view:
-                    cam_pose_world = view["camera_pose"]
-                    if cam_pose_world.dim() == 3 and cam_pose_world.shape[0] == 1:
-                        cam_pose_world = cam_pose_world.squeeze(0)
-                    all_camera_poses_world.append(cam_pose_world)
-            
-        except Exception as e:
-            print(f"警告: 读取 {pt_file} 时出错: {e}")
-            continue
+    # 顺序读取 .pt 文件（PyTorch 张量在多进程间传递有兼容性问题）
+    start_time = time.time()
+    results = list(tqdm(
+        map(_process_single_pt_file, pt_files),
+        total=len(pt_files),
+        desc="读取 .pt 文件",
+        unit="文件"
+    ))
+    read_time = time.time() - start_time
+    print(f"读取 .pt 文件耗时: {read_time:.2f} 秒")
     
+    # 处理结果
+    start_time = time.time()
+    for result in results:
+        frame_data, frame_idx, is_aggregated = result
+        
+        if frame_data is None:
+            continue
+        
+        if is_aggregated:
+            # 这是聚合文件，直接提取数据
+            data = frame_data
+            print(f"检测到聚合文件格式，包含多帧数据")
+            
+            # 首先确定帧数（从任何可用的数据中）
+            num_frames = 0
+            if "depth" in data and data["depth"].dim() >= 2:
+                num_frames = data["depth"].shape[0]
+            elif "images" in data and data["images"].dim() >= 3:
+                num_frames = data["images"].shape[0]
+            elif "world_points" in data and data["world_points"].dim() >= 2:
+                num_frames = data["world_points"].shape[0]
+            elif "pose_enc" in data and data["pose_enc"].dim() >= 2:
+                num_frames = data["pose_enc"].shape[0]
+            elif "extrinsic" in data and data["extrinsic"].dim() >= 2:
+                num_frames = data["extrinsic"].shape[0]
+            
+            if num_frames == 0:
+                print("警告: 无法确定帧数，假设为单帧")
+                num_frames = 1
+            
+            print(f"检测到 {num_frames} 帧数据")
+            
+            # 初始化 frame_indices
+            frame_indices = list(range(num_frames))
+            
+            # 从聚合文件中提取数据
+            if "depth" in data:
+                depth = data["depth"]
+                # 处理各种可能的深度图形状
+                if depth.dim() == 5:  # (1, N, H, W, 1) 或类似
+                    depth = depth.squeeze(0).squeeze(-1)  # 去掉第一个和最后一个维度
+                elif depth.dim() == 4:  # (N, H, W, 1) 或 (1, N, H, W)
+                    if depth.shape[0] == 1:
+                        depth = depth.squeeze(0)
+                    if depth.dim() == 4 and depth.shape[-1] == 1:
+                        depth = depth.squeeze(-1)
+                # 如果是 (N, H, W)，按帧拆分
+                if depth.dim() == 3:
+                    for i in range(depth.shape[0]):
+                        all_depths.append(depth[i])
+                else:
+                    all_depths.append(depth)
+            
+            if "depth_conf" in data:
+                depth_conf = data["depth_conf"]
+                if depth_conf.dim() == 3:
+                    for i in range(depth_conf.shape[0]):
+                        all_depth_confs.append(depth_conf[i])
+                else:
+                    all_depth_confs.append(depth_conf)
+            
+            if "world_points" in data:
+                pts3d = data["world_points"]
+                if pts3d.dim() == 4:  # (N, H, W, 3)
+                    for i in range(pts3d.shape[0]):
+                        all_pts3d.append(pts3d[i])
+                elif pts3d.dim() == 3:  # (N, M, 3)
+                    for i in range(pts3d.shape[0]):
+                        all_pts3d.append(pts3d[i])
+                else:
+                    all_pts3d.append(pts3d)
+            
+            if "world_points_conf" in data:
+                conf = data["world_points_conf"]
+                if conf.dim() == 3:
+                    for i in range(conf.shape[0]):
+                        all_confs.append(conf[i])
+                elif conf.dim() == 2:
+                    for i in range(conf.shape[0]):
+                        all_confs.append(conf[i])
+                else:
+                    all_confs.append(conf)
+            
+            if "pose_enc" in data:
+                camera_pose = data["pose_enc"]
+                if camera_pose.dim() == 3:
+                    for i in range(camera_pose.shape[0]):
+                        all_camera_poses.append(camera_pose[i])
+                else:
+                    all_camera_poses.append(camera_pose)
+            
+            if "extrinsic" in data:
+                extrinsic = data["extrinsic"]
+                if extrinsic.dim() == 3:
+                    for i in range(extrinsic.shape[0]):
+                        all_extrinsics.append(extrinsic[i])
+                else:
+                    all_extrinsics.append(extrinsic)
+            
+            if "intrinsic" in data:
+                intrinsic = data["intrinsic"]
+                if intrinsic is not None:
+                    if intrinsic.dim() == 3:
+                        for i in range(intrinsic.shape[0]):
+                            all_intrinsics.append(intrinsic[i])
+                    elif intrinsic.dim() == 2:
+                        # 单帧的内参，复制给所有帧
+                        for i in range(num_frames):
+                            all_intrinsics.append(intrinsic)
+                    else:
+                        all_intrinsics.append(intrinsic)
+            
+            if "images" in data:
+                images = data["images"]
+                if images.dim() == 4:  # (N, C, H, W) or (N, H, W, C)
+                    for i in range(images.shape[0]):
+                        all_images.append(images[i])
+                else:
+                    all_images.append(images)
+            
+            # 验证数据一致性
+            if all_depths and len(all_depths) != num_frames:
+                print(f"警告: 深度图数量 ({len(all_depths)}) 与帧数 ({num_frames}) 不匹配")
+            if all_images and len(all_images) != num_frames:
+                print(f"警告: 图像数量 ({len(all_images)}) 与帧数 ({num_frames}) 不匹配")
+            
+            # 聚合文件处理完成，跳出循环（只处理第一个文件）
+            break
+        else:
+            # 单帧文件数据
+            if frame_idx is not None:
+                frame_indices.append(frame_idx)
+            else:
+                frame_indices.append(len(frame_indices))
+            
+            if "depth" in frame_data:
+                all_depths.append(frame_data["depth"])
+            if "depth_conf" in frame_data:
+                all_depth_confs.append(frame_data["depth_conf"])
+            if "pts3d" in frame_data:
+                all_pts3d.append(frame_data["pts3d"])
+            if "conf" in frame_data:
+                all_confs.append(frame_data["conf"])
+            if "camera_pose" in frame_data:
+                all_camera_poses.append(frame_data["camera_pose"])
+            if "extrinsic" in frame_data:
+                all_extrinsics.append(frame_data["extrinsic"])
+            if "intrinsic" in frame_data:
+                all_intrinsics.append(frame_data["intrinsic"])
+            if "img" in frame_data:
+                all_images.append(frame_data["img"])
+            if "camera_pose_world" in frame_data:
+                all_camera_poses_world.append(frame_data["camera_pose_world"])
+    process_time = time.time() - start_time
+    print(f"处理结果耗时: {process_time:.2f} 秒")
     print(f"成功读取 {len(frame_indices)} 个文件")
     
     # 聚合所有数据
+    start_time = time.time()
     aggregated_data = {
         "frame_indices": np.array(frame_indices),
     }
@@ -364,9 +431,12 @@ def extract_data_from_pt_files(pt_path: str, output_path: str = None):
     if all_camera_poses_world:
         aggregated_data["camera_pose_world"] = torch.stack(all_camera_poses_world, dim=0)
         print(f"  世界坐标系相机位姿: {aggregated_data['camera_pose_world'].shape}")
+    aggregate_time = time.time() - start_time
+    print(f"聚合数据耗时: {aggregate_time:.2f} 秒")
     
     # 保存到文件
     if output_path:
+        start_time = time.time()
         output_path = Path(output_path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
@@ -376,19 +446,108 @@ def extract_data_from_pt_files(pt_path: str, output_path: str = None):
                 aggregated_data[key] = value.cpu()
         
         torch.save(aggregated_data, output_path)
+        save_time = time.time() - start_time
         print(f"\n数据已保存到: {output_path}")
         print(f"文件大小: {os.path.getsize(output_path) / (1024**2):.2f} MB")
+        print(f"保存文件耗时: {save_time:.2f} 秒")
+    
+    total_time = read_time + process_time + aggregate_time + (save_time if output_path else 0)
+    print(f"\n总耗时: {total_time:.2f} 秒")
     
     return aggregated_data
 
 
-def save_to_directory_format(data: dict, out_dir: str):
+def _save_single_frame(args):
+    """
+    保存单帧数据（用于多进程）
+    
+    Args:
+        args: tuple (i, frame_data_dict, subdirs, c2w, intrinsic_np)
+    
+    Returns:
+        bool: 是否成功
+    """
+    i, frame_data, subdirs, c2w, intrinsic_np = args
+    try:
+        frame_idx = i
+        
+        # 保存深度图
+        if "depth" in frame_data and frame_data["depth"] is not None:
+            depth_i = frame_data["depth"]
+            if isinstance(depth_i, torch.Tensor):
+                depth_i = depth_i.cpu().numpy()
+            np.save(subdirs['depth'] / f"{frame_idx:06d}.npy", depth_i)
+        
+        # 保存深度置信度
+        if "depth_conf" in frame_data and frame_data["depth_conf"] is not None:
+            depth_conf_i = frame_data["depth_conf"]
+            if isinstance(depth_conf_i, torch.Tensor):
+                depth_conf_i = depth_conf_i.cpu().numpy()
+            np.save(subdirs['conf'] / f"{frame_idx:06d}.npy", depth_conf_i)
+        # 或者保存点云置信度
+        elif "conf" in frame_data and frame_data["conf"] is not None:
+            conf_i = frame_data["conf"]
+            if isinstance(conf_i, torch.Tensor):
+                conf_i = conf_i.cpu().numpy()
+            # 如果是点云置信度，可能需要 reshape
+            if conf_i.ndim != 0:
+                np.save(subdirs['conf'] / f"{frame_idx:06d}.npy", conf_i)
+        
+        # 保存彩色图像
+        if "img" in frame_data and frame_data["img"] is not None and iio is not None:
+            img_i = frame_data["img"]
+            if isinstance(img_i, torch.Tensor):
+                img_i = img_i.cpu().numpy()
+            
+            # 处理图像格式：确保是 (H, W, C) 格式
+            if img_i.ndim == 3:
+                if img_i.shape[0] == 3 and img_i.shape[2] != 3:  # (C, H, W)
+                    img_i = img_i.transpose(1, 2, 0)  # (H, W, C)
+                elif img_i.shape[-1] == 3:  # 已经是 (H, W, C)
+                    pass
+                elif img_i.shape[0] == 3:  # (C, H, W)
+                    img_i = img_i.transpose(1, 2, 0)
+            
+            # 归一化到 [0, 255]
+            if img_i.max() <= 1.0:
+                img_i = (img_i * 255).astype(np.uint8)
+            else:
+                img_i = np.clip(img_i, 0, 255).astype(np.uint8)
+            
+            iio.imwrite(subdirs['color'] / f"{frame_idx:06d}.png", img_i)
+        
+        # 保存相机参数
+        if c2w is not None:
+            pose = c2w[i]
+            
+            # 构建内参矩阵
+            if intrinsic_np is not None:
+                if intrinsic_np.shape[-2:] == (3, 3):
+                    if intrinsic_np.ndim == 3:
+                        intr = intrinsic_np[i]
+                    else:
+                        intr = intrinsic_np
+                else:
+                    intr = np.eye(3, dtype=np.float32)
+            else:
+                intr = np.eye(3, dtype=np.float32)
+            
+            np.savez(subdirs['camera'] / f"{frame_idx:06d}.npz", pose=pose, intrinsics=intr)
+        
+        return True
+    except Exception as e:
+        print(f"警告: 保存第 {i} 帧时出错: {e}")
+        return False
+
+
+def save_to_directory_format(data: dict, out_dir: str, num_workers: int = None):
     """
     将数据保存为文件夹格式（depth, conf, color, camera）
     
     Args:
         data: 包含所有数据的字典
         out_dir: 输出目录路径
+        num_workers: 并行处理的进程数，默认使用一半CPU核心
     """
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -461,93 +620,55 @@ def save_to_directory_format(data: dict, out_dir: str):
     # 处理内参
     if intrinsic is not None:
         intrinsic_np = intrinsic.cpu().numpy() if isinstance(intrinsic, torch.Tensor) else intrinsic
-        if intrinsic_np.shape[-2:] == (3, 3):
-            focal = intrinsic_np[:, 0, 0]
-            pp = intrinsic_np[:, :2, 2]
-        else:
-            focal = None
-            pp = None
     else:
-        focal = None
-        pp = None
+        intrinsic_np = None
     
-    # 保存每一帧，使用 tqdm 显示保存进度
-    for i in tqdm(range(N), desc="保存数据", unit="帧"):
-        frame_idx = i
-        
-        # 保存深度图
+    # 准备每帧的数据
+    frame_data_list = []
+    for i in range(N):
+        frame_data = {}
         if depth is not None:
-            depth_i = depth[i]
-            if isinstance(depth_i, torch.Tensor):
-                depth_i = depth_i.cpu().numpy()
-            np.save(subdirs['depth'] / f"{frame_idx:06d}.npy", depth_i)
-        
-        # 保存深度置信度
+            frame_data["depth"] = depth[i]
         if depth_conf is not None:
-            depth_conf_i = depth_conf[i]
-            if isinstance(depth_conf_i, torch.Tensor):
-                depth_conf_i = depth_conf_i.cpu().numpy()
-            np.save(subdirs['conf'] / f"{frame_idx:06d}.npy", depth_conf_i)
-        # 或者保存点云置信度
-        elif conf is not None:
-            conf_i = conf[i]
-            if isinstance(conf_i, torch.Tensor):
-                conf_i = conf_i.cpu().numpy()
-            # 如果是点云置信度，可能需要 reshape
-            if conf_i.ndim == 0:
-                # 标量，跳过
-                pass
-            else:
-                np.save(subdirs['conf'] / f"{frame_idx:06d}.npy", conf_i)
-        
-        # 保存彩色图像
-        if images is not None and iio is not None:
-            img_i = images[i]
-            if isinstance(img_i, torch.Tensor):
-                img_i = img_i.cpu().numpy()
-            
-            # 处理图像格式：确保是 (H, W, C) 格式
-            if img_i.ndim == 3:
-                if img_i.shape[0] == 3 and img_i.shape[2] != 3:  # (C, H, W)
-                    img_i = img_i.transpose(1, 2, 0)  # (H, W, C)
-                elif img_i.shape[-1] == 3:  # 已经是 (H, W, C)
-                    pass
-                elif img_i.shape[0] == 3:  # (C, H, W)
-                    img_i = img_i.transpose(1, 2, 0)
-            
-            # 确保是 RGB 格式（不是 BGR）
-            if img_i.shape[-1] == 3:
-                # 如果通道顺序是 BGR，转换为 RGB
-                # 这里假设已经是 RGB，如果需要可以添加转换
-                pass
-            
-            # 归一化到 [0, 255]
-            if img_i.max() <= 1.0:
-                img_i = (img_i * 255).astype(np.uint8)
-            else:
-                img_i = np.clip(img_i, 0, 255).astype(np.uint8)
-            
-            iio.imwrite(subdirs['color'] / f"{frame_idx:06d}.png", img_i)
-        
-        # 保存相机参数
-        if c2w is not None:
-            pose = c2w[i]
-            
-            # 构建内参矩阵
-            if focal is not None and pp is not None:
-                intr = np.eye(3, dtype=np.float32)
-                intr[0, 0] = intr[1, 1] = focal[i]
-                intr[:2, 2] = pp[i]
-            elif intrinsic_np is not None:
-                if intrinsic_np.shape[-2:] == (3, 3):
-                    intr = intrinsic_np[i]
-                else:
-                    intr = np.eye(3, dtype=np.float32)
-            else:
-                intr = np.eye(3, dtype=np.float32)
-            
-            np.savez(subdirs['camera'] / f"{frame_idx:06d}.npz", pose=pose, intrinsics=intr)
+            frame_data["depth_conf"] = depth_conf[i]
+        if conf is not None:
+            frame_data["conf"] = conf[i]
+        if images is not None:
+            frame_data["img"] = images[i]
+        frame_data_list.append(frame_data)
     
+    # 确定工作进程数
+    if num_workers is None:
+        num_workers = max(1, cpu_count() - 1)  # 使用一半的CPU核心
+    num_workers = min(num_workers, N)  # 不超过帧数
+    
+    # 准备任务参数
+    tasks = [
+        (i, frame_data_list[i], subdirs, c2w, intrinsic_np)
+        for i in range(N)
+    ]
+    
+    # 并行保存每一帧
+    start_time = time.time()
+    if N > 1 and num_workers > 1:
+        print(f"使用 {num_workers} 个进程并行保存数据...")
+        with Pool(processes=num_workers) as pool:
+            list(tqdm(
+                pool.imap(_save_single_frame, tasks),
+                total=N,
+                desc="保存数据",
+                unit="帧"
+            ))
+    else:
+        # 单进程保存
+        list(tqdm(
+            map(_save_single_frame, tasks),
+            total=N,
+            desc="保存数据",
+            unit="帧"
+        ))
+    save_time = time.time() - start_time
+    print(f"保存数据耗时: {save_time:.2f} 秒")
     print(f"数据已保存到: {out_dir}")
     print(f"  - depth: {subdirs['depth']}")
     print(f"  - conf: {subdirs['conf']}")
@@ -556,18 +677,25 @@ def save_to_directory_format(data: dict, out_dir: str):
     
     # 自动生成深度图可视化（在 depth 同级目录创建 depth_vis）
     try:
+        start_time = time.time()
         visualize_depth_folder(str(subdirs['depth']))
+        vis_time = time.time() - start_time
+        print(f"生成深度图可视化耗时: {vis_time:.2f} 秒")
     except Exception as e:
         print(f"警告: 生成深度图可视化时出错: {e}")
     
     # 自动生成相机轨迹可视化
     try:
+        start_time = time.time()
         visualize_camera_trajectory(str(subdirs['camera']))
+        traj_time = time.time() - start_time
+        print(f"生成相机轨迹可视化耗时: {traj_time:.2f} 秒")
     except Exception as e:
         print(f"警告: 生成相机轨迹可视化时出错: {e}")
     
     # 自动生成点云（融合所有帧，使用体素降采样）
     try:
+        start_time = time.time()
         generate_point_clouds(
             str(subdirs['depth']),
             str(subdirs['camera']),
@@ -575,8 +703,78 @@ def save_to_directory_format(data: dict, out_dir: str):
             str(out_dir / "pointclouds"),
             voxel_size=0.005  # 2cm 体素大小，只对合并点云降采样，单帧保持原始密度
         )
+        pcd_time = time.time() - start_time
+        print(f"生成点云耗时: {pcd_time:.2f} 秒")
     except Exception as e:
         print(f"警告: 生成点云时出错: {e}")
+    
+    total_time = save_time
+    try:
+        total_time += vis_time
+    except:
+        pass
+    try:
+        total_time += traj_time
+    except:
+        pass
+    try:
+        total_time += pcd_time
+    except:
+        pass
+    print(f"\n保存到目录格式总耗时: {total_time:.2f} 秒")
+
+
+def _colorize_depth(depth, vmin, vmax):
+    """将深度图转换为灰度图像（模块级函数，支持多进程）"""
+    # 处理不同形状的深度图，确保是 2D (H, W)
+    depth = np.asarray(depth)
+    if depth.ndim > 2:
+        # 如果是 (1, H, W) 或 (H, W, 1) 等，压缩到 2D
+        depth = depth.squeeze()
+    if depth.ndim != 2:
+        raise ValueError(f"深度图应该是 2D 数组，但得到形状: {depth.shape}")
+
+    H, W = depth.shape
+
+    # 创建掩码（有效深度值）
+    mask = depth > 0
+
+    # 归一化深度值到 [0, 1]
+    # 近处深度值小 -> 0（黑色），远处深度值大 -> 1（白色）
+    depth_normalized = np.clip(depth, vmin, vmax)
+    depth_normalized = (depth_normalized - vmin) / (vmax - vmin + 1e-8)
+    depth_normalized = np.clip(depth_normalized, 0, 1)
+
+    # 转换为灰度图 (H, W)
+    # 近处（深度值小）-> 黑色（0），远处（深度值大）-> 白色（255）
+    gray = depth_normalized
+
+    # 将无效区域设为黑色
+    gray[~mask] = 0
+
+    # 转换为 uint8 格式 (0-255)
+    return (gray * 255).astype(np.uint8)
+
+
+def _process_single_depth_vis(args):
+    """处理单个深度图的可视化（模块级函数，支持多进程）"""
+    depth_file, output_dir, vmin, vmax = args
+    try:
+        depth = np.load(depth_file)
+        gray_depth = _colorize_depth(depth, vmin, vmax)
+        output_file = output_dir / f"{depth_file.stem}.jpg"
+        if iio is not None:
+            iio.imwrite(output_file, gray_depth)
+        else:
+            try:
+                import cv2
+                cv2.imwrite(str(output_file), gray_depth)
+            except ImportError:
+                pass
+        return True
+    except Exception as e:
+        print(f"警告: 处理 {depth_file} 时出错: {e}")
+        return False
 
 
 def visualize_depth_folder(depth_dir: str, output_dir: str = None):
@@ -627,72 +825,22 @@ def visualize_depth_folder(depth_dir: str, output_dir: str = None):
     vmax = np.percentile(all_depths, 99)
     
     print(f"深度范围: [{vmin:.3f}, {vmax:.3f}]")
-    
-    # 可视化函数 - 保存为灰度图
-    def colorize_depth(depth, vmin, vmax):
-        """将深度图转换为灰度图像"""
-        # 处理不同形状的深度图，确保是 2D (H, W)
-        depth = np.asarray(depth)
-        if depth.ndim > 2:
-            # 如果是 (1, H, W) 或 (H, W, 1) 等，压缩到 2D
-            depth = depth.squeeze()
-        if depth.ndim != 2:
-            raise ValueError(f"深度图应该是 2D 数组，但得到形状: {depth.shape}")
-        
-        H, W = depth.shape
-        
-        # 创建掩码（有效深度值）
-        mask = depth > 0
-        
-        # 归一化深度值到 [0, 1]
-        # 近处深度值小 -> 0（黑色），远处深度值大 -> 1（白色）
-        depth_normalized = np.clip(depth, vmin, vmax)
-        depth_normalized = (depth_normalized - vmin) / (vmax - vmin + 1e-8)
-        depth_normalized = np.clip(depth_normalized, 0, 1)
-        
-        # 转换为灰度图 (H, W)
-        # 近处（深度值小）-> 黑色（0），远处（深度值大）-> 白色（255）
-        gray = depth_normalized
-        
-        # 将无效区域设为黑色
-        gray[~mask] = 0
-        
-        # 转换为 uint8 格式 (0-255)
-        return (gray * 255).astype(np.uint8)
-    
-    # 处理每个深度图的辅助函数（用于多进程）
-    def process_single_depth_vis(args):
-        depth_file, output_dir, vmin, vmax = args
-        try:
-            depth = np.load(depth_file)
-            gray_depth = colorize_depth(depth, vmin, vmax)
-            output_file = output_dir / f"{depth_file.stem}.jpg"
-            if iio is not None:
-                iio.imwrite(output_file, gray_depth)
-            else:
-                try:
-                    import cv2
-                    cv2.imwrite(str(output_file), gray_depth)
-                except ImportError:
-                    pass
-            return True
-        except Exception as e:
-            print(f"警告: 处理 {depth_file} 时出错: {e}")
-            return False
-    
+
     # 并行处理深度图可视化
-    num_workers_vis = max(1, min(cpu_count() // 2, len(depth_files)))
+    start_time = time.time()
+    num_workers_vis = max(1, min(cpu_count() - 1, len(depth_files)))
     tasks_vis = [(df, output_dir, vmin, vmax) for df in depth_files]
-    
+
     with Pool(processes=num_workers_vis) as pool:
         list(tqdm(
-            pool.imap(process_single_depth_vis, tasks_vis),
+            pool.imap(_process_single_depth_vis, tasks_vis),
             total=len(depth_files),
             desc="可视化深度图",
             unit="文件"
         ))
-    
+    vis_time = time.time() - start_time
     print(f"\n深度图可视化已保存到: {output_dir}")
+    print(f"可视化耗时: {vis_time:.2f} 秒")
     print(f"共保存 {len(depth_files)} 个可视化图像")
 
 
@@ -932,10 +1080,27 @@ def depth_to_camera_coords(depth, intrinsic):
     return points_cam
 
 
+def _save_single_pointcloud(args):
+    """保存单帧点云（模块级函数，支持多进程）"""
+    points_world, colors, i, output_dir = args
+    try:
+        if points_world is None:
+            return None
+        frame_pcd = o3d.geometry.PointCloud()
+        frame_pcd.points = o3d.utility.Vector3dVector(points_world)
+        frame_pcd.colors = o3d.utility.Vector3dVector(colors)
+        frame_pcd_file = output_dir / f"frame_{i:06d}.pcd"
+        o3d.io.write_point_cloud(str(frame_pcd_file), frame_pcd)
+        return i
+    except Exception as e:
+        print(f"警告: 保存第 {i} 帧点云时出错: {e}")
+        return None
+
+
 def generate_point_clouds(depth_dir: str, camera_dir: str, color_dir: str = None, output_dir: str = None, voxel_size: float = 0.04, num_workers: int = None):
     """
     从深度图、相机位姿和图像生成点云（PCD格式）
-    
+
     Args:
         depth_dir: depth 文件夹路径
         camera_dir: camera 文件夹路径
@@ -977,7 +1142,7 @@ def generate_point_clouds(depth_dir: str, camera_dir: str, color_dir: str = None
     
     # 确定工作进程数
     if num_workers is None:
-        num_workers = max(1, cpu_count() // 2)  # 使用一半的CPU核心
+        num_workers = max(1, cpu_count() - 1)  # 使用一半的CPU核心
     num_workers = min(num_workers, num_files)  # 不超过文件数量
     
     print(f"使用 {num_workers} 个进程并行处理...")
@@ -992,6 +1157,7 @@ def generate_point_clouds(depth_dir: str, camera_dir: str, color_dir: str = None
     all_points = [None] * num_files
     all_colors = [None] * num_files
     
+    start_time = time.time()
     with Pool(processes=num_workers) as pool:
         results = list(tqdm(
             pool.imap(process_single_frame_pointcloud, tasks),
@@ -999,25 +1165,31 @@ def generate_point_clouds(depth_dir: str, camera_dir: str, color_dir: str = None
             desc="生成点云",
             unit="帧"
         ))
+    process_time = time.time() - start_time
+    print(f"生成点云耗时: {process_time:.2f} 秒")
     
-    # 整理结果并先保存单帧点云
+    # 整理结果
     valid_frames = []
-    print("\n保存每帧的点云...")
-    for points_world, colors, i in tqdm(results, desc="保存单帧点云", unit="帧"):
+    save_tasks = []
+    for points_world, colors, i in results:
         if points_world is not None:
             all_points[i] = points_world
             all_colors[i] = colors
             valid_frames.append(i)
-            
-            # 立即保存单帧点云
-            frame_pcd = o3d.geometry.PointCloud()
-            frame_pcd.points = o3d.utility.Vector3dVector(points_world)
-            frame_pcd.colors = o3d.utility.Vector3dVector(colors)
-            
-            # 单帧点云不降采样，保持原始密度（只在合并时降采样）
-            
-            frame_pcd_file = output_dir / f"frame_{i:06d}.pcd"
-            o3d.io.write_point_cloud(str(frame_pcd_file), frame_pcd)
+            save_tasks.append((points_world, colors, i, output_dir))
+
+    # 并行保存单帧点云
+    print(f"\n使用 {num_workers} 个进程并行保存 {len(save_tasks)} 帧点云...")
+    start_time = time.time()
+    with Pool(processes=num_workers) as pool:
+        list(tqdm(
+            pool.imap(_save_single_pointcloud, save_tasks),
+            total=len(save_tasks),
+            desc="保存单帧点云",
+            unit="帧"
+        ))
+    save_frames_time = time.time() - start_time
+    print(f"保存单帧点云耗时: {save_frames_time:.2f} 秒")
     
     # 过滤掉 None 值
     all_points = [p for p in all_points if p is not None]
@@ -1031,6 +1203,7 @@ def generate_point_clouds(depth_dir: str, camera_dir: str, color_dir: str = None
     
     # 合并所有点云
     print("\n合并所有点云...")
+    start_time = time.time()
     merged_points = np.vstack(all_points)
     merged_colors = np.vstack(all_colors)
     
@@ -1067,11 +1240,219 @@ def generate_point_clouds(depth_dir: str, camera_dir: str, color_dir: str = None
     # 保存合并的点云
     merged_pcd_file = output_dir / "merged_pointcloud.pcd"
     o3d.io.write_point_cloud(str(merged_pcd_file), pcd)
+    merge_time = time.time() - start_time
     print(f"\n合并的点云已保存到: {merged_pcd_file}")
+    print(f"合并点云耗时: {merge_time:.2f} 秒")
     
+    total_time = process_time + save_frames_time + merge_time
     print(f"\n所有点云已保存到: {output_dir}")
     print(f"  - 合并点云: merged_pointcloud.pcd")
     print(f"  - 单帧点云: frame_XXXXXX.pcd (共 {len(valid_frames)} 帧)")
+    print(f"生成点云总耗时: {total_time:.2f} 秒")
+
+
+def stream_extract_and_save(pt_path: str, out_dir: str, generate_pcd: bool = True):
+    """
+    流式处理：边读取边保存，避免内存溢出
+    适用于大量 .pt 文件的情况
+
+    Args:
+        pt_path: .pt 文件路径或包含 .pt 文件的目录路径
+        out_dir: 输出目录路径
+        generate_pcd: 是否同时生成点云
+    """
+    pt_path = Path(pt_path)
+    out_dir = Path(out_dir)
+
+    if not pt_path.exists():
+        raise ValueError(f"路径不存在: {pt_path}")
+
+    # 获取所有 .pt 文件
+    if pt_path.is_file():
+        pt_files = [pt_path]
+    elif pt_path.is_dir():
+        pt_files = sorted(pt_path.glob("*.pt"))
+        if not pt_files:
+            raise ValueError(f"在 {pt_path} 中未找到 .pt 文件")
+    else:
+        raise ValueError(f"路径既不是文件也不是目录: {pt_path}")
+
+    print(f"找到 {len(pt_files)} 个 .pt 文件，使用流式处理模式")
+
+    # 创建输出目录
+    out_dir.mkdir(parents=True, exist_ok=True)
+    subdirs = {
+        'depth': out_dir / 'depth',
+        'conf': out_dir / 'conf',
+        'color': out_dir / 'color',
+        'camera': out_dir / 'camera',
+    }
+    for subdir in subdirs.values():
+        subdir.mkdir(parents=True, exist_ok=True)
+
+    # 点云目录
+    if generate_pcd and HAS_OPEN3D:
+        pcd_dir = out_dir / 'pointclouds'
+        pcd_dir.mkdir(parents=True, exist_ok=True)
+    else:
+        pcd_dir = None
+
+    # 流式处理每个文件
+    success_count = 0
+    pcd_count = 0
+    start_time = time.time()
+
+    for pt_file in tqdm(pt_files, desc="流式处理", unit="文件"):
+        try:
+            # 读取单个 .pt 文件
+            data = torch.load(pt_file, map_location='cpu', weights_only=False)
+
+            # 获取帧索引
+            frame_idx = data.get("meta", {}).get("frame_idx", None)
+            if frame_idx is None:
+                try:
+                    frame_idx = int(pt_file.stem)
+                except ValueError:
+                    frame_idx = success_count
+
+            # 提取 pred 和 view 数据
+            pred = data.get("pred", {})
+            view = data.get("view", {})
+
+            # 提取并保存深度图
+            depth = None
+            if "depth" in pred:
+                depth = pred["depth"]
+                if isinstance(depth, torch.Tensor):
+                    depth = depth.cpu().numpy()
+                if depth.ndim > 2:
+                    depth = depth.squeeze()
+                np.save(subdirs['depth'] / f"{frame_idx:06d}.npy", depth)
+
+            # 保存深度置信度
+            if "depth_conf" in pred:
+                depth_conf = pred["depth_conf"]
+                if isinstance(depth_conf, torch.Tensor):
+                    depth_conf = depth_conf.cpu().numpy()
+                if depth_conf.ndim > 2:
+                    depth_conf = depth_conf.squeeze()
+                np.save(subdirs['conf'] / f"{frame_idx:06d}.npy", depth_conf)
+
+            # 提取并保存彩色图像
+            img = None
+            if "img" in view:
+                img = view["img"]
+                if isinstance(img, torch.Tensor):
+                    img = img.cpu().numpy()
+                if img.ndim == 4:
+                    img = img.squeeze(0)
+                if img.ndim == 3:
+                    if img.shape[0] == 3 and img.shape[2] != 3:
+                        img = img.transpose(1, 2, 0)
+                if img.max() <= 1.0:
+                    img_save = (img * 255).astype(np.uint8)
+                else:
+                    img_save = np.clip(img, 0, 255).astype(np.uint8)
+                if iio is not None:
+                    iio.imwrite(subdirs['color'] / f"{frame_idx:06d}.png", img_save)
+
+            # 提取相机参数
+            extrinsic = pred.get("extrinsic_world_to_cam", None)
+            intrinsic = pred.get("intrinsic", None)
+            c2w = None
+
+            if extrinsic is not None:
+                if isinstance(extrinsic, torch.Tensor):
+                    extrinsic = extrinsic.cpu().numpy()
+                if extrinsic.ndim > 2:
+                    extrinsic = extrinsic.squeeze()
+                # 计算 camera-to-world (c2w)
+                try:
+                    c2w = np.linalg.inv(extrinsic)
+                except:
+                    c2w = extrinsic
+
+                if intrinsic is not None:
+                    if isinstance(intrinsic, torch.Tensor):
+                        intrinsic = intrinsic.cpu().numpy()
+                    if intrinsic.ndim > 2:
+                        intrinsic = intrinsic.squeeze()
+                else:
+                    intrinsic = np.eye(3, dtype=np.float32)
+
+                np.savez(subdirs['camera'] / f"{frame_idx:06d}.npz", pose=c2w, intrinsics=intrinsic)
+
+            # 同时生成并保存点云（利用已经在内存中的数据）
+            if pcd_dir is not None and depth is not None and c2w is not None and intrinsic is not None:
+                try:
+                    # 深度图反投影到相机坐标系
+                    H, W = depth.shape[:2]
+                    fx, fy = intrinsic[0, 0], intrinsic[1, 1]
+                    cx, cy = intrinsic[0, 2], intrinsic[1, 2]
+
+                    u, v = np.meshgrid(np.arange(W), np.arange(H))
+                    z = depth
+                    x = (u - cx) * z / fx
+                    y = (v - cy) * z / fy
+                    points_cam = np.stack([x, y, z], axis=-1).reshape(-1, 3)
+
+                    # 过滤无效点
+                    valid_mask = (z.reshape(-1) > 0) & (z.reshape(-1) < 100)
+                    points_cam = points_cam[valid_mask]
+
+                    # 变换到世界坐标系
+                    R = c2w[:3, :3]
+                    t = c2w[:3, 3]
+                    points_world = (R @ points_cam.T).T + t
+
+                    # 获取颜色
+                    if img is not None:
+                        if img.max() <= 1.0:
+                            colors = img.reshape(-1, 3)[valid_mask]
+                        else:
+                            colors = (img / 255.0).reshape(-1, 3)[valid_mask]
+                    else:
+                        colors = np.ones((len(points_world), 3)) * 0.5
+
+                    # 保存点云
+                    if len(points_world) > 0:
+                        pcd = o3d.geometry.PointCloud()
+                        pcd.points = o3d.utility.Vector3dVector(points_world)
+                        pcd.colors = o3d.utility.Vector3dVector(colors)
+                        o3d.io.write_point_cloud(str(pcd_dir / f"frame_{frame_idx:06d}.pcd"), pcd)
+                        pcd_count += 1
+                except Exception as e:
+                    pass  # 点云生成失败不影响主流程
+
+            success_count += 1
+
+            # 显式删除数据释放内存
+            del data, pred, view
+
+        except Exception as e:
+            print(f"\n警告: 处理 {pt_file} 时出错: {e}")
+            continue
+
+    elapsed = time.time() - start_time
+    print(f"\n流式处理完成: {success_count}/{len(pt_files)} 个文件")
+    if pcd_dir is not None:
+        print(f"生成点云: {pcd_count} 帧")
+    print(f"耗时: {elapsed:.2f} 秒")
+    print(f"数据已保存到: {out_dir}")
+
+    # 生成深度图可视化
+    try:
+        print("\n生成深度图可视化...")
+        visualize_depth_folder(str(subdirs['depth']))
+    except Exception as e:
+        print(f"警告: 生成深度图可视化时出错: {e}")
+
+    # 生成相机轨迹可视化
+    try:
+        print("\n生成相机轨迹可视化...")
+        visualize_camera_trajectory(str(subdirs['camera']))
+    except Exception as e:
+        print(f"警告: 生成相机轨迹可视化时出错: {e}")
 
 
 def main():
@@ -1097,22 +1478,46 @@ def main():
         default=None,
         help="输出目录路径（保存为文件夹格式：depth/, conf/, color/, camera/，并自动生成 depth_vis/）"
     )
-    
+    parser.add_argument(
+        "--streaming",
+        action="store_true",
+        help="启用流式处理模式（边读取边保存，避免内存溢出）。文件数超过 2000 时自动启用"
+    )
+    parser.add_argument(
+        "--streaming_threshold",
+        type=int,
+        default=2000,
+        help="自动启用流式模式的文件数阈值"
+    )
+
     args = parser.parse_args()
-    
+
     try:
-        # 如果指定了 output_dir，不保存 .pt 文件
-        output_pt = args.output if not args.output_dir else None
-        data = extract_data_from_pt_files(args.pt_dir, output_pt)
-        
-        # 如果指定了 output_dir，保存为文件夹格式（会自动生成 depth_vis）
-        if args.output_dir:
-            save_to_directory_format(data, args.output_dir)
-        
+        pt_path = Path(args.pt_dir)
+
+        # 检查文件数量，决定是否使用流式模式
+        use_streaming = args.streaming
+        if not use_streaming and args.output_dir and pt_path.is_dir():
+            num_files = len(list(pt_path.glob("*.pt")))
+            if num_files > args.streaming_threshold:
+                print(f"检测到 {num_files} 个文件（超过阈值 {args.streaming_threshold}），自动启用流式处理模式")
+                use_streaming = True
+
+        if use_streaming and args.output_dir:
+            # 流式处理模式
+            stream_extract_and_save(args.pt_dir, args.output_dir)
+        else:
+            # 原有模式：先加载所有数据，再保存
+            output_pt = args.output if not args.output_dir else None
+            data = extract_data_from_pt_files(args.pt_dir, output_pt)
+
+            if args.output_dir:
+                save_to_directory_format(data, args.output_dir)
+
         print("\n" + "="*60)
         print("提取完成！")
         print("="*60)
-        
+
     except Exception as e:
         print(f"错误: {e}")
         import traceback
