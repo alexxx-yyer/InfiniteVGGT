@@ -303,7 +303,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--checkpoint_path", 
         type=str, 
-        default="/checkpoints.pth", 
+        default="./checkpoints.pth", 
         help="Path to the model checkpoint file (.pth)."
     )
     parser.add_argument(
